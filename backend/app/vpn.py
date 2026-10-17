@@ -37,8 +37,9 @@ def parse_vless_uri(uri: str) -> dict:
         raise ValueError("В ссылке указан некорректный UUID VLESS")
     query = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=50)
     get = lambda key, default="": query.get(key, [default])[-1]
-    if get("encryption", "none") != "none":
-        raise ValueError("Поддерживается VLESS encryption=none")
+    encryption = get("encryption", "none") or "none"
+    if encryption != "none" and not encryption.startswith("mlkem768x25519plus."):
+        raise ValueError("Поддерживается VLESS encryption=none или mlkem768x25519plus")
     if get("type") != "xhttp" or get("security") != "reality":
         raise ValueError("Пока поддерживается формат VLESS XHTTP + REALITY")
     sni, public_key = get("sni"), get("pbk") or get("password")
@@ -51,12 +52,25 @@ def parse_vless_uri(uri: str) -> dict:
     short_id = get("sid")
     if len(short_id) > 16 or (short_id and not re.fullmatch(r"[0-9a-fA-F]+", short_id)):
         raise ValueError("REALITY short ID должен быть hex-строкой длиной до 16 символов")
+    extra = None
+    if get("extra"):
+        try:
+            extra = json.loads(get("extra"))
+        except (TypeError, json.JSONDecodeError):
+            raise ValueError("Параметр XHTTP extra должен содержать корректный JSON") from None
+        if not isinstance(extra, dict):
+            raise ValueError("Параметр XHTTP extra должен быть JSON-объектом")
+    x_padding_bytes = get("x_padding_bytes")
+    if x_padding_bytes:
+        extra = extra or {}
+        extra.setdefault("xPaddingBytes", x_padding_bytes)
     return {
         "uri": uri.strip(), "host": host, "port": port, "id": user_id,
+        "encryption": encryption,
         "sni": sni, "public_key": public_key, "fingerprint": fingerprint,
         "short_id": short_id, "spider_x": get("spx", "/") or "/",
         "path": get("path", "/") or "/", "transport_host": get("host"),
-        "mode": mode, "mldsa65_verify": get("pqv"),
+        "mode": mode, "extra": extra, "mldsa65_verify": get("pqv"),
         "name": unquote(parsed.fragment).strip()[:100],
     }
 
@@ -148,9 +162,10 @@ class XrayManager:
             xhttp["host"] = p["transport_host"]
         outbounds = [{"tag": "vless-egress", "protocol": "vless",
                       "settings": {"vnext": [{"address": p["host"], "port": p["port"],
-                                                "users": [{"id": p["id"], "encryption": "none"}]}]},
+                                                "users": [{"id": p["id"], "encryption": p["encryption"]}]}]},
                       "streamSettings": {"network": "xhttp", "security": "reality",
-                                         "realitySettings": reality, "xhttpSettings": xhttp}},
+                                         "realitySettings": reality,
+                                         "xhttpSettings": {**xhttp, **({"extra": p["extra"]} if p["extra"] else {})}}},
                      {"tag": "direct-egress", "protocol": "freedom", "settings": {}}]
         return {
             "log": {"loglevel": "warning"},

@@ -6,12 +6,14 @@ mkdir -p "$directory"
 chown 10001:10001 "$directory"
 chmod 700 "$directory"
 
+generated_access_path=0
 if [ ! -s "$directory/access-path" ]; then
   umask 077
   openssl rand -base64 48 | tr -dc 'A-Za-z0-9_-' | head -c 48 > "$directory/access-path"
   printf '\n' >> "$directory/access-path"
   chown 10001:10001 "$directory/access-path"
   chmod 600 "$directory/access-path"
+  generated_access_path=1
 fi
 
 if [ ! -s "$directory/ip" ]; then
@@ -23,6 +25,19 @@ if [ ! -s "$directory/ip" ]; then
   printf '%s\n' "$initial_target" > "$directory/ip"
   chown 10001:10001 "$directory/ip"
   chmod 600 "$directory/ip"
+fi
+
+if [ "$generated_access_path" = 1 ]; then
+  target=$(cat "$directory/ip")
+  if [ "$target" = localhost ]; then
+    origin="https://localhost:${PANEL_HTTP_PORT:-8080}"
+  else
+    port=${PANEL_HTTPS_PORT:-443}
+    origin="https://$target"
+    [ "$port" = 443 ] || origin="$origin:$port"
+  fi
+  printf '\n[PRNL] Первый запуск. Ссылка для входа: %s/%s/\n' "$origin" "$(cat "$directory/access-path")"
+  printf '[PRNL] Это секретная ссылка: не публикуйте её и сохраните в менеджере паролей.\n\n'
 fi
 
 render_access_config() {

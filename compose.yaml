@@ -80,6 +80,8 @@ services:
       - panel_tls:/panel-tls
     environment:
       PANEL_CERT_HOST: ${PANEL_CERT_HOST:-localhost}
+      PANEL_HTTP_PORT: ${PANEL_HTTP_PORT:-8080}
+      PANEL_HTTPS_PORT: ${PANEL_HTTPS_PORT:-443}
     depends_on:
       - web
     restart: unless-stopped
