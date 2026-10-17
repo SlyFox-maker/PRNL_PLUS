@@ -20,6 +20,7 @@ class Runner:
         self.lock = asyncio.Lock()
         self.vpn = vpn
         self.on_unexpected_exit = None
+        self.on_link_ready = None
         self.session_logs_enabled = True
         self.domain_history_enabled = True
         self.root = Path(os.environ.get('RUNTIME_DIR', '/tmp/wlp-runtime'))
@@ -51,7 +52,7 @@ class Runner:
                 'rx_rate': job.get('rx_rate', 0) if fresh else None, 'tx_rate': job.get('tx_rate', 0) if fresh else None,
                 'active_connections': m.get('active_connections') if fresh else None}
 
-    async def start(self, sid):
+    async def start(self, sid, *, notify_on_link=True):
         async with self.lock:
             if sid in self.jobs:
                 raise ValueError('Сессия уже запущена')
@@ -108,7 +109,9 @@ class Runner:
                     raise ValueError('Не удалось запустить Creator')
                 job = {'proc': proc, 'account_id': account.id, 'directory': directory, 'secrets': secrets, 'stopping': False,
                        'traffic_base_rx': s.rx_total, 'traffic_base_tx': s.tx_total,
-                       'cookie_text': cookie_file.read_text()}
+                       'cookie_text': cookie_file.read_text(),
+                       'previous_link': decrypt(s.link_secret) if s.link_secret else '',
+                       'notify_on_link': notify_on_link}
                 self.jobs[sid] = job
                 s.state = 'starting'
                 s.link_secret = None
@@ -222,11 +225,15 @@ class Runner:
                 lines = path.read_text().strip().splitlines()
                 if lines:
                     link = lines[-1].strip()
+                    link_ready = False
                     with DB.begin() as db:
                         s = db.get(Session, sid)
                         if s and s.state == 'starting':
                             s.state = 'running'
                             s.link_secret = encrypt(link)
+                            link_ready = True
+                    if link_ready and job['notify_on_link'] and self.on_link_ready:
+                        self.on_link_ready(sid, link, job['previous_link'])
         
     async def stop(self, sid, interrupted=False):
         async with self.lock:

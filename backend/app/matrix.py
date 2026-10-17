@@ -28,6 +28,8 @@ class MatrixIntegration:
         self.sync_task = None
         self.sync_error = ""
         self.recovery_tasks = {}
+        self.notification_tasks = set()
+        self.notification_locks = {}
         self.command_locks = {}
         self.room_locks = {}
         self.stopping = False
@@ -35,6 +37,28 @@ class MatrixIntegration:
     def load(self):
         if self.state_file.exists():
             self.config = decrypt(self.state_file.read_text())
+
+    @property
+    def enabled(self):
+        return bool(self.config and self.config.get("enabled", True))
+
+    async def set_enabled(self, enabled):
+        if not self.config:
+            raise ValueError("Сначала подключите Matrix аккаунт в настройках")
+        if self.enabled == enabled:
+            return self.status()
+        if not enabled:
+            await self.stop()
+        self.config["enabled"] = enabled
+        if enabled:
+            # Commands written while the bot was paused must not execute on resume.
+            self.config["since"] = ""
+            self.config["seen_events"] = []
+        self.sync_error = ""
+        self._persist()
+        if enabled:
+            await self.start()
+        return self.status()
 
     def _persist(self):
         if not self.config:
@@ -107,7 +131,8 @@ class MatrixIntegration:
         return self.status()
 
     def status(self):
-        return {"configured": bool(self.config), "user_id": self.config.get("user_id", "") if self.config else "",
+        return {"configured": bool(self.config), "enabled": self.enabled,
+                "user_id": self.config.get("user_id", "") if self.config else "",
                 "homeserver": self.config.get("homeserver", "") if self.config else "",
                 "sync_running": bool(self.sync_task and not self.sync_task.done()), "error": self.sync_error}
 
@@ -281,6 +306,8 @@ class MatrixIntegration:
             return room_id, user_id, display_name
 
     async def start_conversation(self, sid):
+        if not self.enabled:
+            return
         with DB() as db:
             session = db.get(Session, sid)
             if not session or not session.matrix_user_id:
@@ -333,8 +360,68 @@ class MatrixIntegration:
                                                  "info": {"mimetype": "image/png", "size": len(buffer.getvalue()),
                                                           "w": image.width, "h": image.height}})
 
+    def _queue_notification(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self.notification_tasks.add(task)
+        task.add_done_callback(self.notification_tasks.discard)
+
+    def queue_link_ready(self, sid, link, old_link=""):
+        if self.enabled:
+            self._queue_notification(self._notify_link_ready(sid, link, old_link))
+
+    async def _notify_link_ready(self, sid, link, old_link):
+        lock = self.notification_locks.setdefault(sid, asyncio.Lock())
+        async with lock:
+            with DB() as db:
+                session = db.get(Session, sid)
+                if not session or not session.matrix_user_id or session.state != "running" or not session.link_secret:
+                    return
+                if decrypt(session.link_secret) != link:
+                    return
+            try:
+                await self.send_link(sid, link, old_link)
+                self.runner.log(sid, "Новая ссылка и QR отправлены Matrix пользователю", "info")
+            except Exception as exc:
+                self.runner.log(sid, f"Matrix не смог отправить новую ссылку и QR: {exc}", "error")
+
+    def queue_manual_stop(self, sid):
+        if not self.enabled:
+            return
+        with DB() as db:
+            session = db.get(Session, sid)
+            if not session or not session.matrix_user_id or session.state != "stopped":
+                return
+            name, user_id = session.name, session.matrix_user_id
+        self._queue_notification(self._notify_manual_stop(sid, name, user_id))
+
+    async def _notify_manual_stop(self, sid, name, user_id):
+        lock = self.notification_locks.setdefault(sid, asyncio.Lock())
+        async with lock:
+            with DB() as db:
+                session = db.get(Session, sid)
+                if not session or session.matrix_user_id != user_id:
+                    return
+            try:
+                await self.send_notice(sid, f"Звонок «{name}» остановлен администратором. Старая ссылка больше не действует. Когда звонок запустят снова, я пришлю новую ссылку и QR-код.")
+                self.runner.log(sid, "Matrix пользователь уведомлён об остановке звонка", "info")
+            except Exception as exc:
+                self.runner.log(sid, f"Matrix не смог сообщить об остановке звонка: {exc}", "error")
+
+    async def _notify_interruption(self, sid, name, user_id):
+        lock = self.notification_locks.setdefault(sid, asyncio.Lock())
+        async with lock:
+            with DB() as db:
+                session = db.get(Session, sid)
+                if not session or session.matrix_user_id != user_id:
+                    return
+            try:
+                await self.send_notice(sid, f"Звонок «{name}» прервался. Пытаюсь восстановить его; новую ссылку и QR-код пришлю после запуска.")
+                self.runner.log(sid, "Matrix пользователь уведомлён о прерывании звонка", "info")
+            except Exception as exc:
+                self.runner.log(sid, f"Matrix не смог сообщить о прерывании звонка: {exc}", "error")
+
     async def start(self):
-        if not self.config:
+        if not self.enabled:
             return
         if self.sync_task and not self.sync_task.done():
             return
@@ -357,6 +444,12 @@ class MatrixIntegration:
                 recovery.cancel()
         if recoveries:
             await asyncio.gather(*recoveries, return_exceptions=True)
+        notifications = list(self.notification_tasks)
+        for notification in notifications:
+            notification.cancel()
+        if notifications:
+            await asyncio.gather(*notifications, return_exceptions=True)
+        self.notification_tasks.clear()
 
     async def _sync_loop(self):
         try:
@@ -431,7 +524,7 @@ class MatrixIntegration:
             if sid in self.runner.jobs:
                 await self.runner.stop(sid)
             try:
-                await self.runner.start(sid)
+                await self.runner.start(sid, notify_on_link=False)
                 new_link = await self._wait_for_link(sid, old_link, 90)
                 if not new_link:
                     raise ValueError("Creator не создал новую ссылку за 90 секунд")
@@ -459,6 +552,8 @@ class MatrixIntegration:
         return ""
 
     async def handle_unexpected_exit(self, sid):
+        if not self.enabled:
+            return
         if sid in self.recovery_tasks:
             return
         task = asyncio.create_task(self._recover_session(sid))
@@ -476,6 +571,8 @@ class MatrixIntegration:
             user_id = session.matrix_user_id
             old_link = decrypt(session.link_secret) if session.link_secret else ""
             name = session.name
+        if self.enabled:
+            self._queue_notification(self._notify_interruption(sid, name, user_id))
         for attempt in range(1, 4):
             await asyncio.sleep(attempt)
             with DB() as db:
@@ -486,15 +583,20 @@ class MatrixIntegration:
                 return
             try:
                 self.runner.log(sid, f"Matrix auto recovery: попытка {attempt}/3", "warning")
-                await self.runner.start(sid)
+                await self.runner.start(sid, notify_on_link=False)
                 link = await self._wait_for_link(sid, old_link, 90)
                 if link:
-                    await self.send_link(sid, link, old_link)
                     with DB.begin() as db:
                         session = db.get(Session, sid)
                         if session:
                             session.matrix_retry_exhausted = False
-                    self.runner.log(sid, "Звонок восстановлен; новая ссылка и QR отправлены в Matrix", "info")
+                    try:
+                        lock = self.notification_locks.setdefault(sid, asyncio.Lock())
+                        async with lock:
+                            await self.send_link(sid, link, old_link)
+                        self.runner.log(sid, "Звонок восстановлен; новая ссылка и QR отправлены в Matrix", "info")
+                    except Exception as exc:
+                        self.runner.log(sid, f"Звонок восстановлен, но Matrix не смог отправить ссылку и QR: {exc}", "error")
                     return
             except Exception as exc:
                 self.runner.log(sid, f"Matrix auto recovery attempt {attempt}/3 failed: {exc}", "error")

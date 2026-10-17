@@ -133,6 +133,105 @@ time.sleep(30)
     assert c.request('DELETE',f'/api/sessions/{s}',json={}).status_code==200
 
 
+def test_matrix_notifies_on_normal_start_and_manual_stop(client, monkeypatch):
+    c, tmp, factory = client
+    login(c)
+    a = account(c)
+    binary = tmp/'bin'/'headless-telemost-creator'
+    binary.parent.mkdir()
+    binary.write_text('''#!/usr/bin/env python3
+import argparse,time
+p=argparse.ArgumentParser();p.add_argument('--cookies');p.add_argument('--write-file');p.add_argument('--resources');a=p.parse_args()
+open(a.write_file,'w').write('https://telemost.yandex.ru/j/matrix-test')
+time.sleep(30)
+''')
+    binary.chmod(0o755)
+    sid = c.post('/api/sessions', json={'name':'Matrix session','account_id':a['id']}).json()['id']
+    from app import main, matrix
+    from app.db import Session
+    monkeypatch.setattr(matrix, 'DB', factory)
+    with factory.begin() as db:
+        db.get(Session, sid).matrix_user_id = '@recipient:example.org'
+    main.matrix_manager.config = {'user_id':'@bot:example.org'}
+    links, notices = [], []
+
+    async def send_link(session_id, link, old_link=''):
+        links.append((session_id, link, old_link))
+
+    async def send_notice(session_id, body):
+        notices.append((session_id, body))
+
+    monkeypatch.setattr(main.matrix_manager, 'send_link', send_link)
+    monkeypatch.setattr(main.matrix_manager, 'send_notice', send_notice)
+    assert c.post(f'/api/sessions/{sid}/start', json={}).status_code == 200
+
+    async def wait_for_link():
+        for _ in range(100):
+            await main.runner.tick()
+            if links:
+                return
+            await asyncio.sleep(.02)
+        raise AssertionError('Matrix did not receive the new link')
+
+    c.portal.call(wait_for_link)
+    assert links == [(sid, 'https://telemost.yandex.ru/j/matrix-test', '')]
+    c.portal.call(main.runner.tick)
+    assert len(links) == 1
+    assert c.post(f'/api/sessions/{sid}/stop', json={}).status_code == 200
+
+    async def wait_for_stop_notice():
+        for _ in range(100):
+            if notices:
+                return
+            await asyncio.sleep(.02)
+        raise AssertionError('Matrix did not receive the stop notice')
+
+    c.portal.call(wait_for_stop_notice)
+    assert len(notices) == 1
+    assert notices[0][0] == sid and 'остановлен администратором' in notices[0][1]
+
+
+def test_matrix_recovery_notifies_before_new_link_without_duplicate(client, monkeypatch):
+    c, _, factory = client
+    login(c)
+    a = account(c)
+    sid = c.post('/api/sessions', json={'name':'Recovering','account_id':a['id']}).json()['id']
+    from app import main, matrix
+    from app.db import Session
+    from app.security import encrypt
+    monkeypatch.setattr(matrix, 'DB', factory)
+    with factory.begin() as db:
+        session = db.get(Session, sid)
+        session.matrix_user_id = '@recipient:example.org'
+        session.state = 'error'
+        session.link_secret = encrypt('https://telemost.yandex.ru/j/old')
+    main.matrix_manager.config = {'user_id':'@bot:example.org'}
+    events, starts = [], []
+
+    async def send_notice(session_id, body):
+        events.append(('notice', session_id, body))
+
+    async def send_link(session_id, link, old_link=''):
+        events.append(('link', session_id, link, old_link))
+
+    async def start(session_id, *, notify_on_link=True):
+        starts.append(notify_on_link)
+        main.runner.jobs[session_id] = {}
+
+    async def wait_for_link(session_id, old_link, timeout):
+        return 'https://telemost.yandex.ru/j/new'
+
+    monkeypatch.setattr(main.matrix_manager, 'send_notice', send_notice)
+    monkeypatch.setattr(main.matrix_manager, 'send_link', send_link)
+    monkeypatch.setattr(main.runner, 'start', start)
+    monkeypatch.setattr(main.matrix_manager, '_wait_for_link', wait_for_link)
+    c.portal.call(main.matrix_manager._recover_session, sid)
+    assert starts == [False]
+    assert [event[0] for event in events] == ['notice', 'link']
+    assert events[1][2:] == ('https://telemost.yandex.ru/j/new', 'https://telemost.yandex.ru/j/old')
+    main.runner.jobs.pop(sid, None)
+
+
 def test_redact():
     from app.security import redact
     assert 'secret' not in redact('password=secret')

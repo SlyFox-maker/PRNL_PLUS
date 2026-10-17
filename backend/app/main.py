@@ -118,6 +118,7 @@ async def lifespan(app):
     matrix_manager = MatrixIntegration(runtime, runner)
     matrix_manager.load()
     runner.on_unexpected_exit = matrix_manager.handle_unexpected_exit
+    runner.on_link_ready = matrix_manager.queue_link_ready
     matrix_bootstrap = runtime / 'matrix-env-bootstrap.done'
     matrix_env = (os.environ.get('MATRIX_HOMESERVER', '').strip(),
                   os.environ.get('MATRIX_USERNAME', '').strip(), os.environ.get('MATRIX_PASSWORD', ''))
@@ -383,6 +384,10 @@ class MatrixGreetingInput(BaseModel):
     greeting: str = Field(max_length=500)
 
 
+class MatrixEnabledInput(BaseModel):
+    enabled: bool
+
+
 def vpn_status():
     return vpn_manager.status(len(runner.jobs) if runner else 0)
 
@@ -440,6 +445,11 @@ async def matrix_login(data: MatrixLoginInput):
         raise
     except Exception:
         raise ValueError('Не удалось подключить Matrix аккаунт') from None
+
+
+@app.put('/api/settings/matrix/enabled')
+async def update_matrix_enabled(data: MatrixEnabledInput):
+    return await matrix_manager.set_enabled(data.enabled)
 
 
 @app.put('/api/settings/matrix/greeting')
@@ -1260,7 +1270,10 @@ async def start_session(sid: str):
 async def stop_session(sid: str):
     with DB() as db:
         get_session(db, sid)
+    was_active = sid in runner.jobs
     await runner.stop(sid)
+    if was_active:
+        matrix_manager.queue_manual_stop(sid)
     return {'ok': True}
 
 
