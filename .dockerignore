@@ -1,0 +1,43 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+
+# Git and local tooling
+.git
+.gitignore
+.venv
+venv
+.idea
+.vscode
+.DS_Store
+
+# Caches and generated files
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+**/node_modules
+**/dist
+coverage
+htmlcov
+
+# Runtime data and user exports
+.runtime
+runtime
+data
+logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+cookies*.json
+cookies*.zip
+*.har

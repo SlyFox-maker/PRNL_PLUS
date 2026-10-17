@@ -1,0 +1,89 @@
+name: wlp-control
+services:
+  db:
+    image: postgres:17-alpine
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      POSTGRES_DB: wlp
+      POSTGRES_USER: wlp
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run python3 scripts/configure.py}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U wlp -d wlp]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      DATABASE_URL: postgresql+psycopg://wlp:${POSTGRES_PASSWORD}@db:5432/wlp
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Run python3 scripts/configure.py}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Run python3 scripts/configure.py}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-https://localhost:8080}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      XRAY_VLESS_URI: ${XRAY_VLESS_URI:-}
+      XRAY_ENABLED: ${XRAY_ENABLED:-false}
+      MATRIX_HOMESERVER: ${MATRIX_HOMESERVER:-}
+      MATRIX_USERNAME: ${MATRIX_USERNAME:-}
+      MATRIX_PASSWORD: ${MATRIX_PASSWORD:-}
+      PANEL_BIND_IP: ${PANEL_BIND_IP:-127.0.0.1}
+      PANEL_HTTP_PORT: ${PANEL_HTTP_PORT:-8080}
+      PANEL_HTTPS_PORT: ${PANEL_HTTPS_PORT:-443}
+      PANEL_TLS_DIR: /panel-tls
+    volumes:
+      - runtime:/runtime
+      - panel_tls:/panel-tls
+    depends_on:
+      db:
+        condition: service_healthy
+    shm_size: 512mb
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    init: true
+    stop_grace_period: 25s
+    restart: unless-stopped
+  web:
+    build: ./frontend
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    depends_on:
+      - backend
+    restart: unless-stopped
+  panel-tls:
+    build: ./panel-tls
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ports:
+      - "${PANEL_BIND_IP:-127.0.0.1}:${PANEL_HTTPS_PORT:-443}:443"
+      - "${PANEL_BIND_IP:-127.0.0.1}:${PANEL_HTTP_PORT:-8080}:8080"
+    volumes:
+      - panel_tls:/panel-tls
+    environment:
+      PANEL_CERT_HOST: ${PANEL_CERT_HOST:-localhost}
+    depends_on:
+      - web
+    restart: unless-stopped
+volumes:
+  postgres:
+  runtime:
+  panel_tls:
