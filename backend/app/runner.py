@@ -61,7 +61,7 @@ class Runner:
                 account = db.get(Account, s.account_id)
                 if not account.secret:
                     raise ValueError('Сначала войдите в аккаунт и сохраните cookies')
-                if any(j['account_id'] == account.id for j in self.jobs.values()):
+                if account.platform != 'telemost' and any(j['account_id'] == account.id for j in self.jobs.values()):
                     raise ValueError('Этот аккаунт уже используется. Остановите его сессию: обновляемые токены нельзя разделять.')
                 binary = Path(os.environ.get('CREATOR_BIN_DIR', '/opt/creators')) / f'headless-{account.platform}-creator'
                 if not binary.is_file():
