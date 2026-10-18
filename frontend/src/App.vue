@@ -22,9 +22,11 @@ const storageError = ref('')
 type VpnStatus = {configured:boolean;enabled:boolean;running:boolean;host:string;port:number;transport:string;name:string;active_sessions:number;error:string}
 const settingsPane = ref('logs'), vpnStatus = ref<VpnStatus|null>(null), vpnUri = ref(''), vpnBusy = ref(false), vpnError = ref('')
 type MatrixStatus = {configured:boolean;enabled:boolean;user_id:string;homeserver:string;sync_running:boolean;error:string;greeting:string}
+type MatrixAvatarSync = {total:number;updated:number;unchanged:number;failed:number;errors:string[]}
 type PanelStatus = {configured:boolean;ip:string;bind_ip:string;http_port:number;https_port:number;url:string;local_url:string;access_path:string;ready:boolean;auto_renew:boolean;expires_at:string;fingerprint:string;ca_fingerprint:string;error:string}
 type MatrixUser = {user_id:string;display_name:string;has_avatar:boolean;unverified?:boolean}
 const matrixStatus = ref<MatrixStatus|null>(null), matrixHomeserver=ref(''), matrixUsername=ref(''), matrixPassword=ref(''), matrixGreeting=ref(''), matrixBusy=ref(false), matrixLoading=ref(false), matrixError=ref('')
+const matrixAvatarSyncResult=ref<MatrixAvatarSync|null>(null), matrixAvatarSyncBusy=ref(false)
 const panelStatus=ref<PanelStatus|null>(null), panelIp=ref(''), panelBusy=ref(false), panelError=ref('')
 const panelPathBusy=ref(false), panelCertificateBusy=ref(false)
 const initialSetupRequired=ref(false)
@@ -229,7 +231,7 @@ async function downloadPanelCa() {
 async function loginMatrix() {
  if(matrixBusy.value)return
  matrixBusy.value=true;matrixError.value=''
- try {matrixStatus.value=await api('/settings/matrix/login','POST',{homeserver:matrixHomeserver.value.trim(),username:matrixUsername.value.trim(),password:matrixPassword.value}) as MatrixStatus;matrixPassword.value='';matrixUsername.value='';notice.value=`Matrix подключён: ${matrixStatus.value.user_id}`}
+ try {matrixStatus.value=await api('/settings/matrix/login','POST',{homeserver:matrixHomeserver.value.trim(),username:matrixUsername.value.trim(),password:matrixPassword.value}) as MatrixStatus;matrixAvatarSyncResult.value=null;matrixPassword.value='';matrixUsername.value='';notice.value=`Matrix подключён: ${matrixStatus.value.user_id}`}
  catch(e) {matrixError.value=(e as Error).message}
  finally {matrixBusy.value=false}
 }
@@ -243,9 +245,19 @@ async function toggleMatrix() {
 async function logoutMatrix() {
  if(matrixBusy.value)return
  matrixBusy.value=true;matrixError.value=''
- try {matrixStatus.value=await api('/settings/matrix','DELETE') as MatrixStatus;matrixUsers.value=[];notice.value='Выход из Matrix выполнен. Для нового подключения потребуется войти снова.'}
+ try {matrixStatus.value=await api('/settings/matrix','DELETE') as MatrixStatus;matrixAvatarSyncResult.value=null;matrixUsers.value=[];notice.value='Выход из Matrix выполнен. Для нового подключения потребуется войти снова.'}
  catch(e) {matrixError.value=(e as Error).message}
  finally {matrixBusy.value=false}
+}
+async function syncMatrixRoomAvatars() {
+ if(matrixBusy.value||!matrixStatus.value?.enabled)return
+ matrixBusy.value=true;matrixAvatarSyncBusy.value=true;matrixError.value='';matrixAvatarSyncResult.value=null
+ try {
+  const result=await api('/settings/matrix/avatars/sync','POST') as MatrixAvatarSync
+  matrixAvatarSyncResult.value=result
+  notice.value=`Аватары Matrix: обновлено ${result.updated}, уже совпадают ${result.unchanged}${result.failed?`, ошибок ${result.failed}`:''}.`
+ } catch(e) {matrixError.value=(e as Error).message}
+ finally {matrixBusy.value=false;matrixAvatarSyncBusy.value=false}
 }
 async function saveMatrixGreeting() {
  if(matrixBusy.value)return
@@ -624,6 +636,7 @@ onUnmounted(()=>{stopStatePolling();if(frameTimer)clearTimeout(frameTimer);if(lo
       <div class="vpn-status-copy"><span class="storage-kicker">MATRIX ACCOUNT</span><h2>{{ !matrixStatus?.configured?'Аккаунт не подключён':matrixStatus.enabled?'Интеграция включена':'Интеграция на паузе' }}</h2><p v-if="matrixStatus?.configured">{{ matrixStatus.user_id }} · {{ matrixStatus.homeserver }}</p><p v-else>Укажи homeserver и войди Matrix-аккаунтом для отправки уведомлений.</p><small v-if="matrixStatus?.error" class="vpn-status-error">{{ matrixStatus.error }}</small><small v-else-if="matrixStatus?.configured">{{ !matrixStatus.enabled?'Команды и уведомления остановлены; авторизация сохранена':matrixStatus.sync_running?'Синхронизация команд активна':'Синхронизация запускается' }}</small></div>
       <div class="matrix-status-actions"><button class="vpn-switch" role="switch" aria-label="Включить или выключить Matrix интеграцию" :aria-checked="matrixStatus?.enabled||false" :disabled="matrixBusy||!matrixStatus?.configured" @click="toggleMatrix"><i><b/></i><span>{{ matrixStatus?.enabled?'ВКЛ':'ВЫКЛ' }}</span></button><button v-if="matrixStatus?.configured" class="secondary danger-outline" :disabled="matrixBusy" @click="logoutMatrix"><LogOut :size="15"/>Выйти из аккаунта</button></div>
      </article>
+     <article class="matrix-avatar-card"><span class="matrix-avatar-card-icon"><UserRound :size="20"/></span><div><span class="storage-kicker">ROOM AVATAR / SYNC</span><h2>Аватар комнат как у бота</h2><p>Новые личные комнаты получают текущую аватарку Matrix-бота сразу. Если ты поменял её позже, синхронизируй уже созданные комнаты: совпадающие останутся без изменений.</p><small v-if="matrixAvatarSyncResult" aria-live="polite">Комнат: {{ matrixAvatarSyncResult.total }} · обновлено: {{ matrixAvatarSyncResult.updated }} · уже совпадают: {{ matrixAvatarSyncResult.unchanged }}<span v-if="matrixAvatarSyncResult.failed"> · не удалось: {{ matrixAvatarSyncResult.failed }}</span></small><small v-for="reason in matrixAvatarSyncResult?.errors||[]" :key="reason" class="matrix-avatar-sync-error">{{ reason }}</small></div><button class="secondary" :disabled="matrixBusy||!matrixStatus?.enabled" @click="syncMatrixRoomAvatars"><RefreshCw :size="15" :class="{spinning:matrixAvatarSyncBusy}"/>{{ matrixAvatarSyncBusy?'СИНХРОНИЗИРУЕМ…':'СИНХРОНИЗИРОВАТЬ КОМНАТЫ' }}</button></article>
      <article class="storage-config matrix-greeting-config"><div class="storage-config-copy"><span class="storage-kicker">01 / FIRST MESSAGE</span><h2>Приветствие нового чата</h2><p>После привязки Matrix-пользователя бот создаст личную комнату, отправит приглашение и первым напишет это сообщение. Вставь <code>{session}</code>, чтобы подставить название сессии. Пустое поле отключает приветствие.</p></div><label class="matrix-greeting-label">ТЕКСТ ПРИВЕТСТВИЯ<textarea v-model="matrixGreeting" maxlength="500" rows="4" placeholder="Привет! Я бот PRNL. Буду присылать ссылку и QR звонка для сессии «{session}». Напишите !help для списка команд."></textarea></label><div class="vpn-actions"><button class="primary" :disabled="matrixBusy" @click="saveMatrixGreeting"><Check :size="15"/>СОХРАНИТЬ ПРИВЕТСТВИЕ</button></div></article>
      <article class="storage-config matrix-config"><div class="storage-config-copy"><span class="storage-kicker">02 / HOMESERVER & LOGIN</span><h2>{{ matrixStatus?.configured?'Подключить другой аккаунт':'Подключение Matrix' }}</h2><p>Поддерживаются http/https адреса, локальные серверы и IP с портом. Пароль не сохраняется: access token шифруется на сервере.</p></div><form class="matrix-login-form" @submit.prevent="loginMatrix"><label>Адрес homeserver<input v-model="matrixHomeserver" required maxlength="500" placeholder="https://matrix.example.org или http://192.168.1.10:8008"></label><label>Логин Matrix<input v-model="matrixUsername" required maxlength="255" autocomplete="username" placeholder="@bot:example.org или имя пользователя"></label><label>Пароль<input v-model="matrixPassword" type="password" required maxlength="1000" autocomplete="current-password" placeholder="Пароль Matrix"></label><button class="primary" :disabled="matrixBusy||!matrixHomeserver.trim()||!matrixUsername.trim()||!matrixPassword">{{ matrixBusy?'ПОДКЛЮЧЕНИЕ…':'ВОЙТИ В MATRIX' }}<ArrowUpRight :size="15"/></button></form></article>
      <article class="storage-config matrix-help"><div class="storage-config-copy"><span class="storage-kicker">03 / SESSION BOT</span><h2>Привязка и команды</h2><p>В карточке сессии открой настройки контакта и выбери Matrix-пользователя. Для локального homeserver внутри Docker используй адрес контейнера/сервиса или <code>host.docker.internal</code>, а не localhost.</p><div class="matrix-commands"><code>!help</code><span>справка по командам</span><code>!refresh ID</code><span>создать новую ссылку для привязанной сессии</span></div><p class="storage-footnote"><Info :size="14"/> Matrix E2EE пока не поддерживается. Бот сам создаст незашифрованную личную комнату и отправит приглашение; адресату нужно принять его, чтобы переписка появилась в клиенте.</p></div></article>

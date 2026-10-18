@@ -452,6 +452,11 @@ async def update_matrix_enabled(data: MatrixEnabledInput):
     return await matrix_manager.set_enabled(data.enabled)
 
 
+@app.post('/api/settings/matrix/avatars/sync')
+async def sync_matrix_room_avatars():
+    return await matrix_manager.sync_room_avatars()
+
+
 @app.put('/api/settings/matrix/greeting')
 def update_matrix_greeting(data: MatrixGreetingInput):
     return {'greeting': matrix_manager.set_greeting(data.greeting)}

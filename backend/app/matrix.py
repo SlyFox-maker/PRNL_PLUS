@@ -217,6 +217,45 @@ class MatrixIntegration:
             raise ValueError("Matrix вернул неподдерживаемый или слишком большой файл аватарки")
         return image.content, mime
 
+    async def bot_avatar_url(self):
+        if not self.config:
+            raise ValueError("Сначала подключите Matrix аккаунт в настройках")
+        response = await self._request("GET", "/_matrix/client/v3/profile/" + quote(self.config["user_id"], safe=""))
+        avatar_url = response.json().get("avatar_url", "")
+        if not isinstance(avatar_url, str) or not re.fullmatch(r"mxc://[^/]+/[^/]+", avatar_url):
+            raise ValueError("У Matrix-бота нет доступной аватарки. Установите её в Matrix и повторите синхронизацию.")
+        return avatar_url
+
+    async def sync_room_avatars(self):
+        if not self.enabled:
+            raise ValueError("Включите Matrix-бота перед синхронизацией аватарок")
+        avatar_url = await self.bot_avatar_url()
+        with DB() as db:
+            room_ids = sorted({row[0] for row in db.query(Session.matrix_room_id).filter(
+                Session.matrix_room_id != "", Session.matrix_user_id != "").all()})
+        result = {"total": len(room_ids), "updated": 0, "unchanged": 0, "failed": 0, "errors": []}
+        for room_id in room_ids:
+            path = f"/_matrix/client/v3/rooms/{quote(room_id, safe='')}/state/m.room.avatar"
+            try:
+                try:
+                    response = await self._request("GET", path)
+                    current = response.json().get("url")
+                except ValueError as exc:
+                    if str(exc) != "Matrix запрос завершился ошибкой HTTP 404":
+                        raise
+                    current = None
+                if current == avatar_url:
+                    result["unchanged"] += 1
+                    continue
+                await self._request("PUT", path, json_body={"url": avatar_url})
+                result["updated"] += 1
+            except Exception as exc:
+                result["failed"] += 1
+                if len(result["errors"]) < 3:
+                    reason = str(exc) if isinstance(exc, ValueError) else "Неизвестная ошибка Matrix"
+                    result["errors"].append(f"{room_id}: {reason}")
+        return result
+
     def _avatar_dir(self, sid):
         # Session IDs are external path parameters; never use them as file paths.
         key = hashlib.sha256(sid.encode("utf-8")).hexdigest()
@@ -279,10 +318,16 @@ class MatrixIntegration:
                 session_name = session.name
                 greeted = session.matrix_greeting_sent
             if not room_id:
-                response = await self._request("POST", "/_matrix/client/v3/createRoom", json_body={
+                room_data = {
                     "invite": [user_id], "is_direct": True, "preset": "trusted_private_chat",
                     "name": f"PRNL · {session_name}"[:100],
-                })
+                }
+                try:
+                    avatar_url = await self.bot_avatar_url()
+                    room_data["initial_state"] = [{"type": "m.room.avatar", "state_key": "", "content": {"url": avatar_url}}]
+                except ValueError as exc:
+                    self.runner.log(sid, f"Matrix аватар комнаты пока не установлен: {exc}", "warning")
+                response = await self._request("POST", "/_matrix/client/v3/createRoom", json_body=room_data)
                 room_id = response.json().get("room_id")
                 if not room_id:
                     raise ValueError("Matrix не вернул ID личной комнаты")
@@ -347,7 +392,11 @@ class MatrixIntegration:
         intro = "Старая ссылка больше не действует. Создан новый звонок." if old_link else "Новая ссылка на звонок готова."
         text = f"{intro}\nСессия: {session_name}\n{link}\n\nQR-код прикреплён следующим сообщением."
         await self._send_with_retries(room_id, {"msgtype": "m.text", "body": text})
-        image = qrcode.make(link)
+        qr = qrcode.QRCode(box_size=12, border=4)
+        qr.add_data(link)
+        qr.make(fit=True)
+        image = qr.make_image(fill_color="black", back_color="white")
+        pixel_width, pixel_height = image.get_image().size
         buffer = io.BytesIO()
         image.save(buffer, format="PNG")
         upload = await self._request("POST", "/_matrix/media/v3/upload", params={"filename": "call-qr.png"},
@@ -358,7 +407,7 @@ class MatrixIntegration:
         await self._send_with_retries(room_id, {"msgtype": "m.image", "body": f"QR · {session_name}",
                                                  "url": content_uri,
                                                  "info": {"mimetype": "image/png", "size": len(buffer.getvalue()),
-                                                          "w": image.width, "h": image.height}})
+                                                          "w": pixel_width, "h": pixel_height}})
 
     def _queue_notification(self, coroutine):
         task = asyncio.create_task(coroutine)
